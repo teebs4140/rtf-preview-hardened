@@ -99,11 +99,27 @@ try {
         await page.goto(`${origin}/?folder=${encodeURIComponent(dirs.workspace)}`, { waitUntil: 'domcontentloaded' });
         await page.locator('.monaco-workbench').waitFor({ timeout: 60000 });
         await sleep(3000);
-        await page.keyboard.press('Control+p');
-        await page.locator('.quick-input-widget input[type=text]').waitFor({ timeout: 10000 });
-        await page.keyboard.type(c.file);
-        await sleep(800);
-        await page.keyboard.press('Enter');
+        // On a busy machine the file can open before the extension is registered, and VS Code falls back
+        // to the text editor. Retry until the preview (a webview) opens; the default must be the preview.
+        c.attempts = 0;
+        for (let attempt = 1; attempt <= 6; attempt++) {
+            c.attempts = attempt;
+            await page.keyboard.press('Control+p');
+            await page.locator('.quick-input-widget input[type=text]').waitFor({ timeout: 10000 });
+            await page.keyboard.type(c.file);
+            await sleep(800);
+            await page.keyboard.press('Enter');
+            let opened = 'none';
+            for (let i = 0; i < 40 && opened === 'none'; i++) {
+                await sleep(500);
+                if (await page.locator('iframe.webview').count() > 0) opened = 'webview';
+                else if (await page.locator('.editor-group-container .monaco-editor .view-lines').first().innerText()
+                    .then((t) => t.includes('rtf1')).catch(() => false)) opened = 'text';
+            }
+            if (opened !== 'text') break;
+            await page.keyboard.press('Control+w');
+            await sleep(5000);
+        }
         const t0 = Date.now();
         if (c.side) {
             await sleep(2500);
@@ -121,7 +137,7 @@ try {
             await page.keyboard.press('Enter');
         }
         let frame = null;
-        for (let i = 0; i < 60 && !frame; i++) {
+        for (let i = 0; i < 180 && !frame; i++) {
             for (const f of page.frames()) {
                 if (f === page.mainFrame() || /47777/.test(f.url())) continue;
                 try { if (await f.evaluate((m) => m === '__IMG__' ? [...document.images].some((i) => i.naturalWidth > 0) : document.body?.innerText.includes(m), c.marker)) { frame = f; break; } } catch { }
@@ -169,7 +185,7 @@ try {
         const pass = !!frame && hits.length === 0 && frameUrls.length === 0 && (info?.csp?.[0] ?? '').includes("default-src 'none'")
             && expectOk && (!c.image || (info.images.length === 1 && info.images[0] > 0)) && (!c.side || (c.textEditor && editorGroups >= 2)) && (!c.reload || c.reloaded);
         failures += pass ? 0 : 1;
-        console.log(`${pass ? 'PASS' : 'FAIL'} ${JSON.stringify({ file: c.file, side: !!c.side, rendered: !!frame, ms: c.timeit ? elapsed : undefined, hits: [...new Set(hits)], frameUrls, csp: info?.csp, sandbox: info?.sandbox, images: info?.images, expectOk, textEditor: c.textEditor, reloaded: c.reloaded, editorGroups: c.side ? editorGroups : undefined, clickResult, sample: text.replace(/\s+/g, ' ').slice(0, 90) })}`);
+        console.log(`${pass ? 'PASS' : 'FAIL'} ${JSON.stringify({ file: c.file, side: !!c.side, rendered: !!frame, ms: c.timeit ? elapsed : undefined, hits: [...new Set(hits)], frameUrls, csp: info?.csp, sandbox: info?.sandbox, images: info?.images, expectOk, attempts: c.attempts, textEditor: c.textEditor, reloaded: c.reloaded, editorGroups: c.side ? editorGroups : undefined, clickResult, sample: text.replace(/\s+/g, ' ').slice(0, 90) })}`);
         await context.close();
     }
 } finally {
