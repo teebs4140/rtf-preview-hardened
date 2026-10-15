@@ -1,132 +1,90 @@
 import * as vscode from 'vscode';
-import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
-import { execFile } from 'child_process';
-import { rtfToHtml } from './rtfParser';
+import { rtfToHtml, escapeText } from './rtfParser';
+
+export const VIEW_TYPE = 'rtfPreviewHardened.viewer';
+
+/** Larger files show a message instead of being parsed. */
+export const MAX_FILE_BYTES = 20 * 1024 * 1024;
+
+/** Re-render this long after the last change, so a file SAS is still writing is not shown half-done. */
+const RELOAD_DELAY_MS = 500;
+
+/** No scripts, frames, fonts, connections or remote images: only inline styles and data: images. */
+const CSP = "default-src 'none'; img-src data:; style-src 'unsafe-inline'";
 
 export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
-    vscode.commands.registerCommand('rtfPreview.open', (uri?: vscode.Uri) => {
-      const fileUri = uri || vscode.window.activeTextEditor?.document.uri;
-      if (!fileUri) {
+    vscode.window.registerCustomEditorProvider(VIEW_TYPE, new RtfPreviewProvider(), {
+      supportsMultipleEditorsPerDocument: true,
+    }),
+    vscode.commands.registerCommand('rtfPreviewHardened.openToSide', (uri?: vscode.Uri) => {
+      const target = uri instanceof vscode.Uri ? uri : vscode.window.activeTextEditor?.document.uri;
+      if (!target) {
         vscode.window.showErrorMessage('No RTF file selected.');
         return;
       }
-      openPreview(fileUri);
-    })
+      return vscode.commands.executeCommand('vscode.openWith', target, VIEW_TYPE, vscode.ViewColumn.Beside);
+    }),
   );
 }
 
-const panels = new Map<string, vscode.WebviewPanel>();
+class RtfPreviewProvider implements vscode.CustomReadonlyEditorProvider {
+  openCustomDocument(uri: vscode.Uri): vscode.CustomDocument {
+    return { uri, dispose: () => { } };
+  }
 
-function openPreview(uri: vscode.Uri) {
-  const key = uri.toString();
-  const existing = panels.get(key);
-  if (existing) { existing.reveal(); return; }
+  resolveCustomEditor(document: vscode.CustomDocument, panel: vscode.WebviewPanel): void {
+    panel.webview.options = { enableScripts: false, enableCommandUris: false, localResourceRoots: [] };
 
-  const fileName = path.basename(uri.fsPath);
-  const panel = vscode.window.createWebviewPanel(
-    'rtfPreview',
-    `Preview: ${fileName}`,
-    vscode.ViewColumn.Beside,
-    { enableScripts: false, localResourceRoots: [] }
-  );
+    let generation = 0;
+    const render = async () => {
+      const mine = ++generation;
+      const html = await renderFile(document.uri);
+      if (mine === generation) panel.webview.html = html;
+    };
+    void render();
 
-  panels.set(key, panel);
-  panel.onDidDispose(() => panels.delete(key));
-  renderRtf(uri, panel);
-
-  const watcher = vscode.workspace.createFileSystemWatcher(
-    new vscode.RelativePattern(vscode.Uri.file(path.dirname(uri.fsPath)), path.basename(uri.fsPath))
-  );
-  watcher.onDidChange(() => renderRtf(uri, panel));
-  panel.onDidDispose(() => watcher.dispose());
+    // Watch the folder and match the exact URI, so file names with glob characters still reload.
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(vscode.Uri.joinPath(document.uri, '..'), '*'));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onChange = (changed: vscode.Uri) => {
+      if (changed.toString() !== document.uri.toString()) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => void render(), RELOAD_DELAY_MS);
+    };
+    watcher.onDidChange(onChange);
+    watcher.onDidCreate(onChange);
+    panel.onDidDispose(() => {
+      clearTimeout(timer);
+      watcher.dispose();
+    });
+  }
 }
 
-async function renderRtf(uri: vscode.Uri, panel: vscode.WebviewPanel) {
-  panel.webview.html = loadingHtml();
-
-  // Built-in parser first — best for SAS RTF output
+export async function renderFile(uri: vscode.Uri): Promise<string> {
   try {
-    const rtfContent = fs.readFileSync(uri.fsPath, 'latin1');
-    const bodyHtml = rtfToHtml(rtfContent);
-    panel.webview.html = wrapHtml(bodyHtml);
-    return;
-  } catch { /* fall through */ }
-
-  // Fallback: LibreOffice
-  const soffice = findBinary(['soffice', 'libreoffice']);
-  if (soffice) {
-    try {
-      const html = await convertWithLibreOffice(uri.fsPath, soffice);
-      panel.webview.html = html;
-      return;
-    } catch { /* fall through */ }
+    const stat = await vscode.workspace.fs.stat(uri);
+    if (stat.size > MAX_FILE_BYTES) {
+      return messageHtml(`This file is ${(stat.size / 1048576).toFixed(0)} MB, larger than the ${MAX_FILE_BYTES / 1048576} MB preview limit. `
+        + 'Use Open With → Text Editor to see its contents.');
+    }
+    const bytes = await vscode.workspace.fs.readFile(uri);
+    const rtf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('latin1');
+    if (!/^\s*\{\\rtf/.test(rtf.slice(0, 64))) {
+      return messageHtml('This file does not start with an RTF header ({\\rtf), so it is not shown as RTF. Use Open With → Text Editor to see its contents.');
+    }
+    return documentHtml(rtfToHtml(rtf));
+  } catch (err) {
+    return messageHtml(`The file could not be shown: ${err instanceof Error ? err.message : String(err)}`);
   }
-
-  // Fallback: pandoc
-  const pandoc = findBinary(['pandoc']);
-  if (pandoc) {
-    try {
-      const html = await convertWithPandoc(uri.fsPath, pandoc);
-      panel.webview.html = html;
-      return;
-    } catch { /* fall through */ }
-  }
-
-  panel.webview.html = errorHtml('Failed to render RTF file.');
 }
 
-function convertWithLibreOffice(filePath: string, soffice: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rtfprev-'));
-    const baseName = path.basename(filePath, path.extname(filePath));
-    const outHtml = path.join(tmpDir, baseName + '.html');
-
-    execFile(soffice, ['--headless', '--norestore', '--convert-to', 'html', '--outdir', tmpDir, filePath], { timeout: 60000 }, (err, _stdout, stderr) => {
-      if (err || !fs.existsSync(outHtml)) { cleanup(tmpDir); return reject(new Error(stderr || 'conversion failed')); }
-      let html = fs.readFileSync(outHtml, 'utf-8');
-      // Inline images as base64
-      html = html.replace(/(<img[^>]+src=")([^"]+)(")/g, (_m, pre, src, post) => {
-        const imgPath = path.resolve(tmpDir, src);
-        if (fs.existsSync(imgPath)) {
-          const ext = path.extname(imgPath).slice(1) || 'png';
-          const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
-          return `${pre}data:${mime};base64,${fs.readFileSync(imgPath).toString('base64')}${post}`;
-        }
-        return _m;
-      });
-      html = injectStyles(html);
-      cleanup(tmpDir);
-      resolve(html);
-    });
-  });
-}
-
-function convertWithPandoc(filePath: string, pandoc: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    execFile(pandoc, [filePath, '-f', 'rtf', '-t', 'html', '--self-contained'], { timeout: 60000, maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) return reject(new Error(stderr || err.message));
-      resolve(injectStyles(stdout));
-    });
-  });
-}
-
-function findBinary(names: string[]): string | null {
-  for (const name of names) {
-    try {
-      const result = require('child_process').execFileSync('which', [name], { encoding: 'utf-8' }).trim();
-      if (result) return result;
-    } catch { /* not found */ }
-  }
-  return null;
-}
-
-function wrapHtml(body: string): string {
+function documentHtml(body: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="${CSP}">
 <style>
   body { font-family: 'Times New Roman', serif; font-size: 10pt; margin: 20px; background: #fff; color: #000; }
   table { border-collapse: collapse; margin: 4px auto; }
@@ -134,31 +92,20 @@ function wrapHtml(body: string): string {
   hr.page-break { border: none; border-top: 2px dashed #999; margin: 20px 0; }
   img { display: block; margin: 8px auto; }
   sup, sub { font-size: 0.7em; }
+  .rtf-header, .rtf-footer { margin: 4px 0; }
+  .rtf-header td, .rtf-footer td { border: none; }
+  .pict-placeholder { margin: 8px auto; padding: 12px 16px; max-width: 6in; border: 1px dashed #999; background: #f6f6f6;
+    font-family: sans-serif; font-size: 9pt; color: #333; }
+  .pict-placeholder code { font-family: monospace; }
 </style>
 </head>
 <body>${body}</body></html>`;
 }
 
-function injectStyles(html: string): string {
-  const css = `<style>
-  body { margin: 20px; background: #fff; color: #000; }
-  table { border-collapse: collapse; }
-  td, th { padding: 2px 6px; vertical-align: top; border: 1px solid #d0d0d0; }
-  img { max-width: 100%; height: auto; }
-</style>`;
-  return html.includes('</head>') ? html.replace('</head>', css + '</head>') : css + html;
+function messageHtml(msg: string): string {
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="${CSP}"></head>
+<body style="margin:20px;font-family:sans-serif"><p>${escapeText(msg)}</p></body></html>`;
 }
 
-function loadingHtml(): string {
-  return `<!DOCTYPE html><html><body style="display:flex;justify-content:center;align-items:center;height:80vh;font-family:sans-serif;color:#666"><p>Converting RTF\u2026</p></body></html>`;
-}
-
-function errorHtml(msg: string): string {
-  return `<!DOCTYPE html><html><body style="margin:20px;font-family:sans-serif"><p style="color:red">Error: ${msg}</p></body></html>`;
-}
-
-function cleanup(dir: string) {
-  try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
-}
-
-export function deactivate() {}
+export function deactivate() { }

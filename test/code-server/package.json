@@ -1,0 +1,10 @@
+{
+  "name": "rtf-preview-hardened-code-server-test",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Runs the packaged extension in a throwaway code-server with headless Chromium. Not part of the extension.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": { "test": "node run.mjs" },
+  "devDependencies": { "playwright-core": "1.61.1" }
+}

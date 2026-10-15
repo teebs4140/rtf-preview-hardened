@@ -1,0 +1,23 @@
+name: CI
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 20.x
+    # Lifecycle scripts are disabled for every install.
+    - run: npm ci --ignore-scripts
+    - run: npx tsc -p .
+    - run: node --test test/unit/*.test.mjs
+    - run: npx --yes @vscode/vsce@3 package --no-dependencies
+    - run: sha256sum rtf-preview-hardened-*.vsix

@@ -1,6 +1,10 @@
-.git
-src/
-node_modules/
+.git/**
+.github/**
+src/**
+test/**
+node_modules/**
 tsconfig.json
-test files/
-.amazonq/
+**/*.map
+**/*.ts
+.gitignore
+*.vsix

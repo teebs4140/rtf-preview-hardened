@@ -1,12 +1,16 @@
 {
-  "name": "rtf-preview",
-  "displayName": "RTF Live Preview",
-  "description": "Preview RTF files with tables, images, and formatting. Works standalone with built-in parser; enhanced rendering with LibreOffice or pandoc.",
-  "version": "0.5.2",
-  "publisher": "tina-zhai",
+  "name": "rtf-preview-hardened",
+  "displayName": "RTF Preview (Hardened Fork)",
+  "description": "Hardened fork of RTF Live Preview 0.5.2: a read-only RTF viewer for SAS ODS RTF output that is safe to open on files from outside.",
+  "version": "1.0.0",
+  "publisher": "dcri-biostats",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tinazhai/rtf_preview"
+    "url": "https://github.com/teebs4140/rtf-preview-hardened.git"
+  },
+  "homepage": "https://github.com/teebs4140/rtf-preview-hardened",
+  "bugs": {
+    "url": "https://github.com/teebs4140/rtf-preview-hardened/issues"
   },
   "license": "MIT",
   "engines": {
@@ -19,52 +23,63 @@
     "rtf",
     "preview",
     "rich text",
-    "SAS"
+    "SAS",
+    "ODS"
   ],
-  "activationEvents": [
-    "onLanguage:rtf"
-  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    },
+    "virtualWorkspaces": true
+  },
+  "activationEvents": [],
   "main": "./out/extension.js",
   "contributes": {
+    "customEditors": [
+      {
+        "viewType": "rtfPreviewHardened.viewer",
+        "displayName": "RTF Preview (Hardened)",
+        "priority": "default",
+        "selector": [
+          {
+            "filenamePattern": "*.rtf"
+          }
+        ]
+      }
+    ],
     "commands": [
       {
-        "command": "rtfPreview.open",
-        "title": "RTF: Open Preview",
+        "command": "rtfPreviewHardened.openToSide",
+        "title": "RTF: Open Preview to the Side",
         "icon": "$(open-preview)"
       }
     ],
     "menus": {
       "editor/title": [
         {
-          "when": "resourceExtname == .rtf",
-          "command": "rtfPreview.open",
+          "when": "resourceExtname == .rtf && activeEditor == workbench.editors.files.textFileEditor",
+          "command": "rtfPreviewHardened.openToSide",
           "group": "navigation"
         }
       ],
       "explorer/context": [
         {
           "when": "resourceExtname == .rtf",
-          "command": "rtfPreview.open",
+          "command": "rtfPreviewHardened.openToSide",
           "group": "navigation"
         }
+      ],
+      "commandPalette": [
+        {
+          "command": "rtfPreviewHardened.openToSide",
+          "when": "resourceExtname == .rtf"
+        }
       ]
-    },
-    "languages": [
-      {
-        "id": "rtf",
-        "extensions": [
-          ".rtf"
-        ],
-        "aliases": [
-          "RTF",
-          "Rich Text Format"
-        ]
-      }
-    ]
+    }
   },
   "scripts": {
-    "build": "tsc",
-    "watch": "tsc -w"
+    "build": "tsc -p .",
+    "test": "tsc -p . && node --test test/unit/*.test.mjs"
   },
   "devDependencies": {
     "@types/node": "^25.5.2",
