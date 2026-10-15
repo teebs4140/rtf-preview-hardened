@@ -74,6 +74,7 @@ for (let i = 0; i < 60; i++) { try { if ((await fetch(`${origin}/healthz`)).ok) 
 const CASES = [
     { file: 'hostile-beacons.rtf', marker: 'BEACON-DONE', click: 'LINK-TO-CLICK' },
     { file: 'hostile-fontname.rtf', marker: 'FONTNAME-PAGE' },
+    { file: 'hostile-mixed.rtf', marker: 'Font switch.', expect: ['<img src="http://127.0.0.1:47777/hex-beacon">', 'Spoofed result: p = 0.001'] },
     { file: 'hostile-refresh.rtf', marker: 'REFRESH-PAGE', wait: 4000 },
     { file: 'hostile-spoof.rtf', marker: 'SPOOFED', expect: ['1.42 (1.10, 1.83)', '0.007', '<style>'] },
     { file: 'titles-footnotes.rtf', marker: 'Footnote: values are from', expect: ['Table 1. Weight \u2265 100 lb by sex', 'Mean \u00B1 SD \u2013 SASHELP.CLASS'] },

@@ -119,8 +119,9 @@ export function rtfToHtml(rtf: string): string {
   let intbl = false;
   let ucSkip = 0;               // \u fallback characters still to skip
 
-  // Current table: start offset in `html`, its column edges and its pending <td>s.
-  let tableStart = 0;
+  // While a table is open, `html` holds only that table and `outerHtml` the output before it,
+  // so finishing a table never re-copies everything already written.
+  let outerHtml = '';
   let tableEdges = new Set<number>();
   let pendingTds: PendingTd[] = [];
 
@@ -129,7 +130,6 @@ export function rtfToHtml(rtf: string): string {
   let hfDepth = 0;
   let bodyHtml = '';
   let footerHtml = '';
-  let headerStart = 0;
 
   const decodeChar = (s: string): string => (cp1252 ? mapCp1252(s) : s);
 
@@ -154,12 +154,13 @@ export function rtfToHtml(rtf: string): string {
     if (inRow) { html += '</tr>'; inRow = false; }
     html += '</table>';
     inTable = false;
-    const grid = [...tableEdges].sort((a, b) => a - b);
+    const grid = new Map([...tableEdges].sort((a, b) => a - b).map((edge, col) => [edge, col]));
     const tds = pendingTds;
-    html = html.slice(0, tableStart) + html.slice(tableStart).replace(/\u0000(\d+)\u0000/g, (_m, n) => {
+    html = outerHtml + html.replace(/\u0000(\d+)\u0000/g, (_m, n) => {
       const td = tds[Number(n)];
       return buildTdOpen(td, colors, computeCellColspan(td.cellDefs, td.cellIndex, grid));
     });
+    outerHtml = '';
     tableEdges = new Set();
     pendingTds = [];
     inMergedCell = false;
@@ -171,7 +172,6 @@ export function rtfToHtml(rtf: string): string {
   }
 
   function emitText(raw: string) {
-    if (state.hidden) return;
     let tok = raw;
     if (ucSkip > 0) {
       const n = Math.min(ucSkip, tok.length);
@@ -179,6 +179,7 @@ export function rtfToHtml(rtf: string): string {
       ucSkip -= n;
       if (tok.length === 0) return;
     }
+    if (state.hidden) return;
 
     // Spaces between table cells are formatting, not text
     if (/^[ \t]*$/.test(tok) && !inTable) {
@@ -249,7 +250,8 @@ export function rtfToHtml(rtf: string): string {
           intbl = false;
           hfKind = cwm[1];
           hfDepth = groupDepth;
-          if (hfKind === 'footer') { bodyHtml = html; html = ''; } else { headerStart = html.length; html += '<div class="rtf-header">'; }
+          bodyHtml = html;
+          html = '';
         }
       }
       continue;
@@ -268,12 +270,12 @@ export function rtfToHtml(rtf: string): string {
         closeTable();
         intbl = false;
         if (hfKind === 'header') {
-          html = hasVisibleContent(html.slice(headerStart)) ? html + '</div>' : html.slice(0, headerStart);
+          html = bodyHtml + (hasVisibleContent(html) ? `<div class="rtf-header">${html}</div>` : '');
         } else {
           footerHtml = hasVisibleContent(html) ? `<div class="rtf-footer">${html}</div>` : '';
           html = bodyHtml;
-          bodyHtml = '';
         }
+        bodyHtml = '';
         hfKind = null;
       }
       groupDepth--;
@@ -370,7 +372,7 @@ export function rtfToHtml(rtf: string): string {
         case 'fi': if (param !== undefined) state.firstIndent = clamp(param, -MAX_TWIPS, MAX_TWIPS); break;
 
         case 'trowd':
-          if (!inTable) { html += '<table>'; inTable = true; tableStart = html.length - '<table>'.length; }
+          if (!inTable) { outerHtml = html; html = '<table>'; inTable = true; }
           if (inCell) { html += '</td>'; inCell = false; }
           if (inRow) { html += '</tr>'; }
           cellDefs = [];
@@ -511,8 +513,8 @@ export function rtfToHtml(rtf: string): string {
   }
 
   closeTable();
-  if (hfKind === 'header') html += '</div>';
-  else if (hfKind === 'footer') { html = bodyHtml; }
+  if (hfKind === 'header') html = bodyHtml + (hasVisibleContent(html) ? `<div class="rtf-header">${html}</div>` : '');
+  else if (hfKind === 'footer') html = bodyHtml;
   flushFooter();
 
   return html;
@@ -537,8 +539,12 @@ function hasVisibleContent(fragment: string): boolean {
   return fragment.replace(/<[^>]*>/g, '').replace(/&nbsp;|\u00A0|&emsp;|\u2003/g, '').trim().length > 0;
 }
 
-function computeCellColspan(cellDefs: CellDef[], cellIndex: number, grid: number[]): number {
-  if (cellIndex >= cellDefs.length || grid.length === 0) return 1;
+/** HTML caps colspan at 1000. */
+const MAX_COLSPAN = 1000;
+
+/** `grid` maps each column edge of the table (sorted) to its column index. */
+function computeCellColspan(cellDefs: CellDef[], cellIndex: number, grid: Map<number, number>): number {
+  if (cellIndex >= cellDefs.length || grid.size === 0) return 1;
   const def = cellDefs[cellIndex];
   const leftEdge = cellIndex > 0 ? cellDefs[cellIndex - 1].rightEdge : 0;
   // For merged-first cells, include continuation cells' edges
@@ -550,13 +556,12 @@ function computeCellColspan(cellDefs: CellDef[], cellIndex: number, grid: number
     }
   }
   // Count grid columns this cell spans
-  let startCol = grid.indexOf(leftEdge) + 1; // grid column after leftEdge; if leftEdge=0, start at 0
+  let startCol = (grid.get(leftEdge) ?? -1) + 1; // grid column after leftEdge; if leftEdge=0, start at 0
   if (leftEdge === 0) startCol = 0;
-  else if (startCol === 0) startCol = 0; // leftEdge not in grid, start at 0
-  let endCol = grid.indexOf(rightEdge);
-  if (endCol < 0) endCol = grid.length - 1;
+  let endCol = grid.get(rightEdge) ?? -1;
+  if (endCol < 0) endCol = grid.size - 1;
   const span = endCol - startCol + 1;
-  return span > 1 ? span : 1;
+  return span > 1 ? Math.min(span, MAX_COLSPAN) : 1;
 }
 
 function cssColor(colors: (string | null)[], index: number, fallback: string): string {
@@ -608,10 +613,11 @@ function parseFontTable(tokens: string[]): Map<number, string> {
     const fm = t.match(/^\\f(\d+)$/);
     if (fm) { num = parseInt(fm[1]); name = ''; continue; }
     if (t.startsWith('\\')) continue;
-    name += t;
-    const semi = name.indexOf(';');
+    // Names longer than any real font are abandoned as they are read, so a huge entry stays linear.
+    const semi = t.indexOf(';');
+    if (name.length <= 64) name += semi >= 0 ? t.slice(0, semi) : t;
     if (semi >= 0) {
-      const n = name.slice(0, semi).trim();
+      const n = name.trim();
       if (num !== undefined && /^[A-Za-z0-9 ._-]{1,64}$/.test(n)) fonts.set(num, n);
       num = undefined;
       name = '';

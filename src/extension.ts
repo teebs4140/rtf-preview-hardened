@@ -37,10 +37,12 @@ class RtfPreviewProvider implements vscode.CustomReadonlyEditorProvider {
     panel.webview.options = { enableScripts: false, enableCommandUris: false, localResourceRoots: [] };
 
     let generation = 0;
+    let disposed = false;
     const render = async () => {
       const mine = ++generation;
       const html = await renderFile(document.uri);
-      if (mine === generation) panel.webview.html = html;
+      if (mine !== generation || disposed) return;
+      try { panel.webview.html = html; } catch { /* panel closed while the file was being read */ }
     };
     void render();
 
@@ -56,6 +58,7 @@ class RtfPreviewProvider implements vscode.CustomReadonlyEditorProvider {
     watcher.onDidChange(onChange);
     watcher.onDidCreate(onChange);
     panel.onDidDispose(() => {
+      disposed = true;
       clearTimeout(timer);
       watcher.dispose();
     });
@@ -65,11 +68,10 @@ class RtfPreviewProvider implements vscode.CustomReadonlyEditorProvider {
 export async function renderFile(uri: vscode.Uri): Promise<string> {
   try {
     const stat = await vscode.workspace.fs.stat(uri);
-    if (stat.size > MAX_FILE_BYTES) {
-      return messageHtml(`This file is ${(stat.size / 1048576).toFixed(0)} MB, larger than the ${MAX_FILE_BYTES / 1048576} MB preview limit. `
-        + 'Use Open With → Text Editor to see its contents.');
-    }
+    if (stat.size > MAX_FILE_BYTES) return tooLargeHtml(stat.size);
     const bytes = await vscode.workspace.fs.readFile(uri);
+    // The file can grow between stat and read (SAS still writing it), so check what was actually read.
+    if (bytes.byteLength > MAX_FILE_BYTES) return tooLargeHtml(bytes.byteLength);
     const rtf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('latin1');
     if (!/^\s*\{\\rtf/.test(rtf.slice(0, 64))) {
       return messageHtml('This file does not start with an RTF header ({\\rtf), so it is not shown as RTF. Use Open With → Text Editor to see its contents.');
@@ -78,6 +80,11 @@ export async function renderFile(uri: vscode.Uri): Promise<string> {
   } catch (err) {
     return messageHtml(`The file could not be shown: ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+function tooLargeHtml(size: number): string {
+  return messageHtml(`This file is ${(size / 1048576).toFixed(0)} MB, larger than the ${MAX_FILE_BYTES / 1048576} MB preview limit. `
+    + 'Use Open With \u2192 Text Editor to see its contents.');
 }
 
 function documentHtml(body: string): string {

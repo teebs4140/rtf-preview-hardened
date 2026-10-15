@@ -19,9 +19,17 @@ const ALL_FIXTURES = ['sas', 'synthetic'].flatMap((d) => readdirSync(join(FIX, d
 
 const TAGS = new Set(['br', 'span', 'table', 'tr', 'td', 'sup', 'sub', 'hr', 'img', 'div', 'code']);
 const CLASSES = new Set(['page-break', 'pict-placeholder', 'rtf-header', 'rtf-footer']);
+// CSS: only these properties, plain values, and no function other than rgb().
+const CSS_PROPS = new Set(['font-weight', 'font-style', 'text-decoration', 'font-size', 'color', 'background-color', 'font-family',
+    'margin-left', 'text-indent', 'width', 'height', 'max-width', 'border-top', 'border-bottom', 'border-left', 'border-right',
+    'vertical-align', 'padding', 'text-align']);
+const cssOk = (v) => v.split(';').every((decl) => {
+    const m = decl.match(/^([a-z-]+):([A-Za-z0-9 #(),.%'_-]*)$/);
+    return !!m && CSS_PROPS.has(m[1]) && [...m[2].matchAll(/([A-Za-z-]+)\(/g)].every((f) => f[1] === 'rgb');
+});
 const ATTR_RULES = {
-    style: /^[A-Za-z0-9 #(),.%:;'_-]*$/,
-    colspan: /^[0-9]{1,4}$/,
+    style: { test: cssOk },
+    colspan: { test: (v) => /^[0-9]{1,4}$/.test(v) && Number(v) <= 1000 },
     src: /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]*$/,
     class: { test: (v) => CLASSES.has(v) },
 };
@@ -57,7 +65,10 @@ test('allowlist checker catches injected markup (self-test)', () => {
     assert.notDeepEqual(checkMarkup('<span style="background:url(http://x)">a</span>'), []);
     assert.notDeepEqual(checkMarkup('<span style="font-family:\'A\'"><img/src=x>\',serif">'), []);
     assert.notDeepEqual(checkMarkup('<iframe src="data:image/png;base64,AA"></iframe>'), []);
-    assert.deepEqual(checkMarkup('<td colspan="2" style="width:1.00in">a &lt;b&gt;</td>'), []);
+    assert.notDeepEqual(checkMarkup(`<span style="background:image-set('https:example.org')">x</span>`), []);
+    assert.notDeepEqual(checkMarkup('<span style="position:fixed;inset:0;background:white">FAKE</span>'), []);
+    assert.notDeepEqual(checkMarkup('<td colspan="10000">x</td>'), []);
+    assert.deepEqual(checkMarkup('<td colspan="2" style="width:1.00in;border-top:1px solid rgb(0,0,0)">a &lt;b&gt;</td>'), []);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -162,6 +173,35 @@ test('sections: each header at its section start, footer at its section end, emp
     assert.equal(html, '<div class="rtf-header">Section one title<br></div>body one<br><div class="rtf-footer">Section one footnote<br></div>'
         + '<hr class="page-break"><div class="rtf-header">Section two title<br></div>body two<br>');
 });
+
+test('hidden text does not leave a \\u fallback count that swallows visible text', () => {
+    assert.equal(rtfToHtml('{\\rtf1\\v\\u65?\\v0 VISIBLE}'), 'VISIBLE');
+});
+
+test('colspan is capped at 1000', () => {
+    const cells = Array.from({ length: 1500 }, (_, i) => `\\cellx${(i + 1) * 10}`).join('');
+    const html = rtfToHtml(`{\\rtf1\\trowd\\cellx15000\\intbl A\\cell\\row\\trowd${cells}\\intbl B\\cell\\row}`);
+    assert.match(html, /<td colspan="1000"/);
+    assert.deepEqual(checkMarkup(html), []);
+});
+
+// Inputs that were quadratic before (found in review): each must stay well under a second.
+const PERF_CASES = {
+    'many small tables': () => '{\\rtf1' + '\\trowd\\cellx100\\intbl X\\cell\\row\\pard Y'.repeat(16000) + '}',
+    'huge font name': () => '{\\rtf1{\\fonttbl{\\f0 ' + 'aaaaaaaaaa\\b '.repeat(80000) + ';}}X}',
+    'many headers and footers': () => '{\\rtf1' + '\\sect{\\header H}{\\footer F}body'.repeat(20000) + '}',
+    'one row with many distinct edges': () => '{\\rtf1\\trowd' + Array.from({ length: 20000 }, (_, i) => `\\cellx${i + 1}`).join('') + '\\intbl' + ' x\\cell'.repeat(20000) + '\\row}',
+};
+for (const [name, make] of Object.entries(PERF_CASES)) {
+    test(`linear time: ${name}`, () => {
+        const input = make();
+        const t0 = Date.now();
+        const html = rtfToHtml(input);
+        const ms = Date.now() - t0;
+        assert.ok(ms < 1500, `${name}: ${input.length} bytes took ${ms} ms`);
+        assert.deepEqual(checkMarkup(html), []);
+    });
+}
 
 // ---------------------------------------------------------------------------------------------
 // Robustness: there is no fallback renderer, so the parser must not throw or hang on broken input.

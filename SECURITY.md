@@ -22,7 +22,8 @@ untrusted input**. A crafted file cannot:
 
 - **Add markup to the preview.** The parser is the only source of markup. Every character taken
   from the file is HTML-escaped, including text, `\'hh` and `\uN` escapes, and symbols. Font names
-  are allowlisted, and numbers that become CSS are clamped. The unit tests check every fixture's
+  are allowlisted, and numbers that become CSS are clamped. CSS is limited to a fixed set of
+  properties, and `rgb()` is the only function. The unit tests check every fixture's
   output, and mutated versions of every fixture, against a strict allowlist of tags, attributes and
   values.
 - **Run script.** The preview webview has scripts disabled. Its Content Security Policy is

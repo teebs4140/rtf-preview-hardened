@@ -64,6 +64,12 @@ The full diff from upstream is `git diff upstream-0.5.2..main`.
 - **More destinations are skipped:** field instructions, bookmarks, list tables, object data,
   comments and similar.
 
+- Rendering stays linear in the input size. Tables and headers are buffered separately, and column
+  lookups use a map. Over-long font names are dropped as they are read. Colspan is capped at 1000.
+- The 20 MB limit is checked on the bytes actually read as well as on the reported size, because a
+  file can grow while SAS is writing it.
+- A preview closed while its file is being read is not updated, so there is no unhandled error.
+
 ### Tests
 
 - `test/unit/parser.test.mjs` (`node --test`):
@@ -71,6 +77,12 @@ The full diff from upstream is `git diff upstream-0.5.2..main`.
   - attack fixtures from the audit;
   - SAS fidelity cases;
   - a mutation fuzz: no throws, bounded time, output still on the allowlist;
+  - linear-time checks on inputs that were quadratic before review;
   - a check that the compiled code has no `child_process`, network or `eval`.
+- `test/unit/extension.test.mjs` uses a mocked `vscode` module to check:
+  - the webview options and CSP;
+  - the size limit before and after reading;
+  - escaped messages;
+  - closing the preview during a read.
 - `test/code-server/run.mjs` runs the VSIX in code-server with a beacon server. All hostile
   fixtures must make zero requests, and the SAS fixtures must render.
