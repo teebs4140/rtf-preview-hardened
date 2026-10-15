@@ -5,6 +5,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { Worker } from 'node:worker_threads';
 
 const require = createRequire(import.meta.url);
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -237,23 +238,47 @@ const PERF_CASES = {
     'cell definitions interleaved with cells': (n) => '{\\rtf1\\trowd\\intbl' + '\\clmrg\\cellx5 X\\cell\\cellx9 Y\\cell'.repeat(n) + '\\row}',
     'deep nesting': (n) => '{\\rtf1' + '{'.repeat(n * 4) + 'x' + '}'.repeat(n * 4) + '}',
 };
-const timeIt = (input) => {
+// Each case runs in a worker thread, so a parser hang fails the test at the deadline instead of hanging it.
+const PARSER_PATH = join(ROOT, 'out', 'rtfParser.js');
+const WORKER_SRC = `
+const { parentPort, workerData } = require('node:worker_threads');
+const { rtfToHtml } = require(workerData.parser);
+const time = (input) => {
     const runs = [];
     for (let i = 0; i < 3; i++) { const t0 = process.hrtime.bigint(); rtfToHtml(input); runs.push(Number(process.hrtime.bigint() - t0) / 1e6); }
     return runs.sort((a, b) => a - b)[1];
 };
+parentPort.postMessage({ small: time(workerData.small), large: time(workerData.large) });`;
+function timeInWorker(small, large, deadlineMs) {
+    return new Promise((resolve, reject) => {
+        const w = new Worker(WORKER_SRC, { eval: true, workerData: { parser: PARSER_PATH, small, large } });
+        const timer = setTimeout(() => { w.terminate(); reject(new Error(`no result within ${deadlineMs} ms`)); }, deadlineMs);
+        w.once('message', (m) => { clearTimeout(timer); w.terminate(); resolve(m); });
+        w.once('error', (e) => { clearTimeout(timer); reject(e); });
+    });
+}
 for (const [name, make] of Object.entries(PERF_CASES)) {
-    test(`linear time: ${name}`, () => {
+    test(`linear time: ${name}`, async () => {
         const n = 16000;
-        const small = timeIt(make(n));
-        const large = timeIt(make(2 * n));
+        const { small, large } = await timeInWorker(make(n), make(2 * n), 20000);
         assert.ok(large < 1000, `${name}: ${make(2 * n).length} bytes took ${large.toFixed(0)} ms`);
         // Quadratic growth would give a ratio near 4; allow noise on small timings.
-        assert.ok(large < Math.max(4 * small, 60) && large / Math.max(small, 1) < 3.2 || large < 60,
+        assert.ok(large < 60 || large / Math.max(small, 1) < 3.2,
             `${name}: ${small.toFixed(1)} ms -> ${large.toFixed(1)} ms when the input doubled`);
         assert.deepEqual(checkMarkup(rtfToHtml(make(n))), []);
     });
 }
+
+test('worker deadline fails a hanging case (self-test)', async () => {
+    const hang = new Worker('for (;;) {}', { eval: true });
+    const result = await Promise.race([
+        new Promise((r) => hang.once('exit', () => r('exited'))),
+        new Promise((r) => setTimeout(() => r('deadline'), 300)),
+    ]);
+    await hang.terminate();
+    assert.equal(result, 'deadline');
+    await assert.rejects(timeInWorker('{\\rtf1 x}', '{\\rtf1 x}', 0), /no result within/);
+});
 
 // ---------------------------------------------------------------------------------------------
 // Robustness: there is no fallback renderer, so the parser must not throw or hang on broken input.
