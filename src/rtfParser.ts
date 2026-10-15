@@ -52,10 +52,11 @@ interface CellDef {
   padRight: number;
   padBottom: number;
   padLeft: number;
+  run?: MergeRun;        // set on continuation cells
 }
 
 /** A <td> whose colspan is filled in when its table closes and the table's column grid is known. */
-interface PendingTd { cellDefs: CellDef[]; cellIndex: number; align: string; }
+interface PendingTd { def: CellDef | undefined; leftEdge: number; rightEdge: number; align: string; }
 
 const TWIPS_PER_INCH = 1440;
 const MAX_TWIPS = 22 * TWIPS_PER_INCH;
@@ -134,7 +135,12 @@ export function rtfToHtml(rtf: string): string {
   const decodeChar = (s: string): string => (cp1252 ? mapCp1252(s) : s);
 
   function openTd(): string {
-    pendingTds.push({ cellDefs, cellIndex, align: state.align });
+    // Edges are fixed now, so cells defined later can't change this cell's span.
+    const def = cellDefs[cellIndex];
+    const leftEdge = cellIndex > 0 ? cellDefs[cellIndex - 1]?.rightEdge ?? 0 : 0;
+    // For merged-first cells, include continuation cells' edges
+    const rightEdge = !def ? 0 : def.mergeFirst ? cellDefs[lastMerged(cellDefs, cellIndex)].rightEdge : def.rightEdge;
+    pendingTds.push({ def, leftEdge, rightEdge, align: state.align });
     return `\u0000${pendingTds.length - 1}\u0000`;
   }
 
@@ -142,7 +148,7 @@ export function rtfToHtml(rtf: string): string {
     if (inTable && !inCell) {
       if (!inRow) { html += '<tr>'; inRow = true; }
       // Skip merged continuation cells
-      while (cellIndex < cellDefs.length && cellDefs[cellIndex].merged) { cellIndex++; }
+      cellIndex = nextUnmerged(cellDefs, cellIndex);
       html += openTd();
       inCell = true;
     }
@@ -158,7 +164,7 @@ export function rtfToHtml(rtf: string): string {
     const tds = pendingTds;
     html = outerHtml + html.replace(/\u0000(\d+)\u0000/g, (_m, n) => {
       const td = tds[Number(n)];
-      return buildTdOpen(td, colors, computeCellColspan(td.cellDefs, td.cellIndex, grid));
+      return buildTdOpen(td, colors, computeCellColspan(td, grid));
     });
     outerHtml = '';
     tableEdges = new Set();
@@ -171,15 +177,9 @@ export function rtfToHtml(rtf: string): string {
     footerHtml = '';
   }
 
-  function emitText(raw: string) {
-    let tok = raw;
-    if (ucSkip > 0) {
-      const n = Math.min(ucSkip, tok.length);
-      tok = tok.slice(n);
-      ucSkip -= n;
-      if (tok.length === 0) return;
-    }
-    if (state.hidden) return;
+  /** Emits decoded text. \u fallback skipping is done by the caller, on the raw input. */
+  function emitText(tok: string) {
+    if (tok.length === 0 || state.hidden) return;
 
     // Spaces between table cells are formatting, not text
     if (/^[ \t]*$/.test(tok) && !inTable) {
@@ -434,7 +434,15 @@ export function rtfToHtml(rtf: string): string {
           if (param !== undefined) {
             const edge = clamp(param, 0, MAX_TWIPS);
             if (inTable) tableEdges.add(edge);
+            const merged = pendingCellBorders.merged || false;
+            const prev = cellDefs[cellDefs.length - 1];
+            let run: MergeRun | undefined;
+            if (merged) {
+              run = prev && prev.merged && prev.run ? prev.run : { end: 0 };
+              run.end = cellDefs.length;
+            }
             cellDefs.push({
+              run,
               borderTop: pendingCellBorders.borderTop || false,
               borderBottom: pendingCellBorders.borderBottom || false,
               borderLeft: pendingCellBorders.borderLeft || false,
@@ -509,7 +517,14 @@ export function rtfToHtml(rtf: string): string {
       continue;
     }
 
-    emitText(decodeChar(tok));
+    // Skip \u fallback characters on the raw text, before decoding can drop bytes.
+    let text = tok;
+    if (ucSkip > 0) {
+      const n = Math.min(ucSkip, text.length);
+      text = text.slice(n);
+      ucSkip -= n;
+    }
+    if (text.length > 0) emitText(decodeChar(text));
   }
 
   closeTable();
@@ -539,22 +554,29 @@ function hasVisibleContent(fragment: string): boolean {
   return fragment.replace(/<[^>]*>/g, '').replace(/&nbsp;|\u00A0|&emsp;|\u2003/g, '').trim().length > 0;
 }
 
+/** A run of consecutive merge-continuation cells (\\clmrg) in one cell-definition list. `end` is the
+ *  index of its last cell; it grows as cells are appended, so every lookup below is O(1). */
+interface MergeRun { end: number; }
+
+/** First index >= `index` that is not a merge continuation. */
+function nextUnmerged(cellDefs: CellDef[], index: number): number {
+  const def = cellDefs[index];
+  return def && def.merged && def.run ? def.run.end + 1 : index;
+}
+
+/** Index of the last continuation cell directly after `index`, or `index` itself if there is none. */
+function lastMerged(cellDefs: CellDef[], index: number): number {
+  const next = cellDefs[index + 1];
+  return next && next.merged && next.run ? next.run.end : index;
+}
+
 /** HTML caps colspan at 1000. */
 const MAX_COLSPAN = 1000;
 
 /** `grid` maps each column edge of the table (sorted) to its column index. */
-function computeCellColspan(cellDefs: CellDef[], cellIndex: number, grid: Map<number, number>): number {
-  if (cellIndex >= cellDefs.length || grid.size === 0) return 1;
-  const def = cellDefs[cellIndex];
-  const leftEdge = cellIndex > 0 ? cellDefs[cellIndex - 1].rightEdge : 0;
-  // For merged-first cells, include continuation cells' edges
-  let rightEdge = def.rightEdge;
-  if (def.mergeFirst) {
-    for (let j = cellIndex + 1; j < cellDefs.length; j++) {
-      if (cellDefs[j].merged) rightEdge = cellDefs[j].rightEdge;
-      else break;
-    }
-  }
+function computeCellColspan(td: PendingTd, grid: Map<number, number>): number {
+  if (!td.def || grid.size === 0) return 1;
+  const { leftEdge, rightEdge } = td;
   // Count grid columns this cell spans
   let startCol = (grid.get(leftEdge) ?? -1) + 1; // grid column after leftEdge; if leftEdge=0, start at 0
   if (leftEdge === 0) startCol = 0;
@@ -569,12 +591,10 @@ function cssColor(colors: (string | null)[], index: number, fallback: string): s
 }
 
 function buildTdOpen(td: PendingTd, colors: (string | null)[], colspan: number): string {
-  const { cellDefs, cellIndex } = td;
-  const def = cellDefs[cellIndex];
+  const def = td.def;
   const styles: string[] = [];
   if (def) {
-    const prevEdge = cellIndex > 0 ? cellDefs[cellIndex - 1].rightEdge : 0;
-    const widthTwips = Math.max(0, def.rightEdge - prevEdge);
+    const widthTwips = Math.max(0, def.rightEdge - td.leftEdge);
     if (colspan <= 1) styles.push(`width:${(widthTwips / TWIPS_PER_INCH).toFixed(2)}in`);
     const side = (on: boolean, name: string, width: number, style: string, color: number) => {
       if (on) styles.push(`border-${name}:${Math.max(1, width / 10)}px ${style || 'solid'} ${cssColor(colors, color, '#000')}`);
@@ -629,9 +649,11 @@ function parseFontTable(tokens: string[]): Map<number, string> {
 /** Color table: index → CSS rgb(), or null for the "auto" entry. */
 function parseColorTable(rtf: string): (string | null)[] {
   const colors: (string | null)[] = [];
-  const m = rtf.match(/\{\\colortbl([\s\S]*?)\}/);
-  if (!m) return ['rgb(0,0,0)'];
-  const entries = m[1].split(';');
+  // indexOf, not a lazy regex: a regex restarts at every '{\colortbl' when the closing brace is missing.
+  const start = rtf.indexOf('{\\colortbl');
+  const end = start < 0 ? -1 : rtf.indexOf('}', start);
+  if (end < 0) return ['rgb(0,0,0)'];
+  const entries = rtf.slice(start + '{\\colortbl'.length, end).split(';');
   entries.pop(); // text after the last ';' is not an entry
   for (const entry of entries) {
     const r = entry.match(/\\red(\d+)/);

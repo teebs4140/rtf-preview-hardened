@@ -64,8 +64,14 @@ The full diff from upstream is `git diff upstream-0.5.2..main`.
 - **More destinations are skipped:** field instructions, bookmarks, list tables, object data,
   comments and similar.
 
-- Rendering stays linear in the input size. Tables and headers are buffered separately, and column
-  lookups use a map. Over-long font names are dropped as they are read. Colspan is capped at 1000.
+- Rendering time stays linear in the input size:
+  - tables and headers are buffered separately;
+  - column lookups use a map;
+  - each run of merged cells records where it ends;
+  - the colour table is found with a single scan;
+  - over-long font names are dropped as they are read.
+
+  Colspan is capped at 1000.
 - The 20 MB limit is checked on the bytes actually read as well as on the reported size, because a
   file can grow while SAS is writing it.
 - A preview closed while its file is being read is not updated, so there is no unhandled error.
@@ -77,7 +83,9 @@ The full diff from upstream is `git diff upstream-0.5.2..main`.
   - attack fixtures from the audit;
   - SAS fidelity cases;
   - a mutation fuzz: no throws, bounded time, output still on the allowlist;
-  - linear-time checks on inputs that were quadratic before review;
+  - scaling checks (input size n vs 2n) on inputs that were quadratic before review;
+  - `\u` fallback skipping over every byte that Windows-1252 decoding drops;
+  - a per-property CSS grammar with numeric bounds in the allowlist;
   - a check that the compiled code has no `child_process`, network or `eval`.
 - `test/unit/extension.test.mjs` uses a mocked `vscode` module to check:
   - the webview options and CSP;

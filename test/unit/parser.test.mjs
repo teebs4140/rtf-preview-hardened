@@ -19,14 +19,42 @@ const ALL_FIXTURES = ['sas', 'synthetic'].flatMap((d) => readdirSync(join(FIX, d
 
 const TAGS = new Set(['br', 'span', 'table', 'tr', 'td', 'sup', 'sub', 'hr', 'img', 'div', 'code']);
 const CLASSES = new Set(['page-break', 'pict-placeholder', 'rtf-header', 'rtf-footer']);
-// CSS: only these properties, plain values, and no function other than rgb().
-const CSS_PROPS = new Set(['font-weight', 'font-style', 'text-decoration', 'font-size', 'color', 'background-color', 'font-family',
-    'margin-left', 'text-indent', 'width', 'height', 'max-width', 'border-top', 'border-bottom', 'border-left', 'border-right',
-    'vertical-align', 'padding', 'text-align']);
-const cssOk = (v) => v.split(';').every((decl) => {
-    const m = decl.match(/^([a-z-]+):([A-Za-z0-9 #(),.%'_-]*)$/);
-    return !!m && CSS_PROPS.has(m[1]) && [...m[2].matchAll(/([A-Za-z-]+)\(/g)].every((f) => f[1] === 'rgb');
-});
+// CSS: each property the parser can emit, with its value grammar and numeric bounds.
+const NUM = (max, min = 0) => (v) => Number(v) >= min && Number(v) <= max;
+const RGB = String.raw`rgb\((\d{1,3}),(\d{1,3}),(\d{1,3})\)`;
+const rgbOk = (v) => [...v.matchAll(/rgb\((\d+),(\d+),(\d+)\)/g)].every((m) => m.slice(1).every(NUM(255)));
+const CSS_RULES = {
+    'font-weight': [/^bold$/],
+    'font-style': [/^italic$/],
+    'text-decoration': [/^(underline|line-through)( line-through)?$/],
+    'font-size': [/^([\d.]+)pt$/, NUM(200, 1)],
+    'color': [new RegExp(`^${RGB}$`), rgbOk],
+    'background-color': [new RegExp(`^${RGB}$`), rgbOk],
+    'font-family': [/^'[A-Za-z0-9 ._-]{1,64}',serif$/],
+    'margin-left': [/^([\d.]+)in$/, NUM(22)],
+    'text-indent': [/^(-?[\d.]+)in$/, NUM(22, -22)],
+    'width': [/^([\d.]+)in$/, NUM(22)],
+    'height': [/^([\d.]+)in$/, NUM(22)],
+    'max-width': [/^100%$/],
+    'vertical-align': [/^(top|middle|bottom)$/],
+    'text-align': [/^(left|center|right|justify)$/],
+    'padding': [/^(\d+)px (\d+)px (\d+)px (\d+)px$/, (...px) => px.every(NUM(72))],
+};
+for (const side of ['top', 'bottom', 'left', 'right']) {
+    CSS_RULES[`border-${side}`] = [new RegExp(`^([\\d.]+)px (solid|dotted|dashed|double|none) (${RGB}|#000)$`), (w) => NUM(10, 1)(w), rgbOk];
+}
+function cssOk(style) {
+    return style.split(';').every((decl) => {
+        const i = decl.indexOf(':');
+        const rule = CSS_RULES[decl.slice(0, i)];
+        if (i < 0 || !rule) return false;
+        const value = decl.slice(i + 1);
+        const m = value.match(rule[0]);
+        if (!m) return false;
+        if (rule[1] && rule[1] !== rgbOk && !rule[1](...m.slice(1).filter((x) => x !== undefined))) return false;
+        return rule.includes(rgbOk) ? rgbOk(value) : true;
+    });
+}
 const ATTR_RULES = {
     style: { test: cssOk },
     colspan: { test: (v) => /^[0-9]{1,4}$/.test(v) && Number(v) <= 1000 },
@@ -68,6 +96,11 @@ test('allowlist checker catches injected markup (self-test)', () => {
     assert.notDeepEqual(checkMarkup(`<span style="background:image-set('https:example.org')">x</span>`), []);
     assert.notDeepEqual(checkMarkup('<span style="position:fixed;inset:0;background:white">FAKE</span>'), []);
     assert.notDeepEqual(checkMarkup('<td colspan="10000">x</td>'), []);
+    assert.notDeepEqual(checkMarkup('<span style="font-size:999999999pt;text-indent:-999999999in;color:transparent">FAKE</span>'), []);
+    assert.notDeepEqual(checkMarkup('<span style="font-weight:banana">x</span>'), []);
+    assert.notDeepEqual(checkMarkup('<span style="color:rgb(999999,-99,4)">x</span>'), []);
+    assert.notDeepEqual(checkMarkup('<span style="color:rgb(999,0,0)">x</span>'), []);
+    assert.deepEqual(checkMarkup(`<span style="font-weight:bold;font-size:9.5pt;color:rgb(0,0,255);font-family:'Arial',serif">x</span>`), []);
     assert.deepEqual(checkMarkup('<td colspan="2" style="width:1.00in;border-top:1px solid rgb(0,0,0)">a &lt;b&gt;</td>'), []);
 });
 
@@ -176,6 +209,13 @@ test('sections: each header at its section start, footer at its section end, emp
 
 test('hidden text does not leave a \\u fallback count that swallows visible text', () => {
     assert.equal(rtfToHtml('{\\rtf1\\v\\u65?\\v0 VISIBLE}'), 'VISIBLE');
+    // Fallback bytes that Windows-1252 decoding drops must still count as the fallback character.
+    for (const b of [0x81, 0x8d, 0x8f, 0x90, 0x9d]) {
+        const raw = String.fromCharCode(b);
+        assert.equal(rtfToHtml(`{\\rtf1\\v\\u65${raw}\\v0 VISIBLE}`), 'VISIBLE', `raw byte 0x${b.toString(16)}`);
+        assert.equal(rtfToHtml(`{\\rtf1\\v\\u65\\'${b.toString(16)}\\v0 VISIBLE}`), 'VISIBLE', `\\'${b.toString(16)}`);
+        assert.equal(rtfToHtml(`{\\rtf1 A\\u8805${raw}B}`), 'A\u2265B', `visible, raw byte 0x${b.toString(16)}`);
+    }
 });
 
 test('colspan is capped at 1000', () => {
@@ -185,21 +225,33 @@ test('colspan is capped at 1000', () => {
     assert.deepEqual(checkMarkup(html), []);
 });
 
-// Inputs that were quadratic before (found in review): each must stay well under a second.
+// Inputs that were quadratic before (found in review). Each is timed at n and 2n: doubling the input
+// must not much more than double the time, and the larger run must stay well under a second.
 const PERF_CASES = {
-    'many small tables': () => '{\\rtf1' + '\\trowd\\cellx100\\intbl X\\cell\\row\\pard Y'.repeat(16000) + '}',
-    'huge font name': () => '{\\rtf1{\\fonttbl{\\f0 ' + 'aaaaaaaaaa\\b '.repeat(80000) + ';}}X}',
-    'many headers and footers': () => '{\\rtf1' + '\\sect{\\header H}{\\footer F}body'.repeat(20000) + '}',
-    'one row with many distinct edges': () => '{\\rtf1\\trowd' + Array.from({ length: 20000 }, (_, i) => `\\cellx${i + 1}`).join('') + '\\intbl' + ' x\\cell'.repeat(20000) + '\\row}',
+    'many small tables': (n) => '{\\rtf1' + '\\trowd\\cellx100\\intbl X\\cell\\row\\pard Y'.repeat(n) + '}',
+    'huge font name': (n) => '{\\rtf1{\\fonttbl{\\f0 ' + 'aaaaaaaaaa\\b '.repeat(n * 5) + ';}}X}',
+    'many headers and footers': (n) => '{\\rtf1' + '\\sect{\\header H}{\\footer F}body'.repeat(n) + '}',
+    'one row with many distinct edges': (n) => '{\\rtf1\\trowd' + Array.from({ length: n }, (_, i) => `\\cellx${i + 1}`).join('') + '\\intbl' + ' x\\cell'.repeat(n) + '\\row}',
+    'unterminated colour tables': (n) => '{\\rtf1' + '{\\colortbl '.repeat(n * 4),
+    'merged cells reused by many rows': (n) => '{\\rtf1\\trowd\\clmgf\\cellx1' + '\\clmrg\\cellx2'.repeat(n * 2) + '\\intbl ' + 'X\\cell\\row '.repeat(n * 2) + '}',
+    'cell definitions interleaved with cells': (n) => '{\\rtf1\\trowd\\intbl' + '\\clmrg\\cellx5 X\\cell\\cellx9 Y\\cell'.repeat(n) + '\\row}',
+    'deep nesting': (n) => '{\\rtf1' + '{'.repeat(n * 4) + 'x' + '}'.repeat(n * 4) + '}',
+};
+const timeIt = (input) => {
+    const runs = [];
+    for (let i = 0; i < 3; i++) { const t0 = process.hrtime.bigint(); rtfToHtml(input); runs.push(Number(process.hrtime.bigint() - t0) / 1e6); }
+    return runs.sort((a, b) => a - b)[1];
 };
 for (const [name, make] of Object.entries(PERF_CASES)) {
     test(`linear time: ${name}`, () => {
-        const input = make();
-        const t0 = Date.now();
-        const html = rtfToHtml(input);
-        const ms = Date.now() - t0;
-        assert.ok(ms < 1500, `${name}: ${input.length} bytes took ${ms} ms`);
-        assert.deepEqual(checkMarkup(html), []);
+        const n = 16000;
+        const small = timeIt(make(n));
+        const large = timeIt(make(2 * n));
+        assert.ok(large < 1000, `${name}: ${make(2 * n).length} bytes took ${large.toFixed(0)} ms`);
+        // Quadratic growth would give a ratio near 4; allow noise on small timings.
+        assert.ok(large < Math.max(4 * small, 60) && large / Math.max(small, 1) < 3.2 || large < 60,
+            `${name}: ${small.toFixed(1)} ms -> ${large.toFixed(1)} ms when the input doubled`);
+        assert.deepEqual(checkMarkup(rtfToHtml(make(n))), []);
     });
 }
 
